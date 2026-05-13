@@ -1,0 +1,282 @@
+use aicli::config::{config_template, AppConfig};
+use aicli::executor;
+use aicli::llm::{create_generator, GeneratedCommand};
+use aicli::prompt::RequestContext;
+use aicli::safety::looks_destructive;
+use clap::Parser;
+use dialoguer::{Confirm, Input};
+use std::io::IsTerminal;
+use std::path::PathBuf;
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "aicli",
+    version,
+    about = "Generate and run shell commands from natural language."
+)]
+struct Cli {
+    /// Natural-language description of the command you want.
+    prompt: Vec<String>,
+
+    /// Provider name from config, or one of: openai_compat, gemini.
+    #[arg(short, long)]
+    provider: Option<String>,
+
+    /// Override the provider model.
+    #[arg(short, long)]
+    model: Option<String>,
+
+    /// Config file path. Defaults to ./config.toml, ~/.config/aicli/config.toml, then ~/.aicli/config.toml.
+    #[arg(short, long)]
+    config: Option<PathBuf>,
+
+    /// Generate and print the command without prompting or executing.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Execute the generated command without interactive editing.
+    #[arg(short = 'y', long)]
+    yes: bool,
+
+    /// Shell used to run the command. Defaults to $SHELL, then /bin/sh.
+    #[arg(long)]
+    shell: Option<String>,
+
+    /// Print a deployable config.toml template and exit.
+    #[arg(long)]
+    config_template: bool,
+
+    /// Print request diagnostics to stderr.
+    #[arg(short, long)]
+    verbose: bool,
+}
+
+#[tokio::main]
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), AppError> {
+    let cli = Cli::parse();
+    if cli.config_template {
+        print!("{}", config_template());
+        return Ok(());
+    }
+
+    if cli.prompt.is_empty() {
+        return Err(AppError::MissingPrompt);
+    }
+
+    let description = cli.prompt.join(" ");
+    let verbose = cli.verbose;
+    let (config, config_source) = AppConfig::load_with_source(cli.config.as_deref())?;
+    let provider = cli
+        .provider
+        .or_else(|| config.default_provider.clone())
+        .unwrap_or_else(|| "gemini".to_string());
+    let shell = cli
+        .shell
+        .or_else(|| std::env::var("SHELL").ok())
+        .unwrap_or_else(|| "/bin/sh".to_string());
+
+    let context = RequestContext {
+        cwd: std::env::current_dir()?.display().to_string(),
+        shell: shell.clone(),
+        os: std::env::consts::OS.to_string(),
+    };
+
+    log_verbose(
+        verbose,
+        format!(
+            "config={}",
+            config_source
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "none (using built-in defaults)".to_string())
+        ),
+    );
+    log_verbose(verbose, format!("provider={provider}"));
+    log_verbose(verbose, format!("cwd={}", context.cwd));
+    log_verbose(verbose, format!("shell={}", context.shell));
+    log_proxy_env(verbose);
+
+    let generator = create_generator(&provider, cli.model, &config, verbose)?;
+    let generated = generator.generate(&description, &context).await?;
+
+    if cli.dry_run {
+        print_generated(&generated);
+        return Ok(());
+    }
+
+    let command = if cli.yes {
+        print_generated(&generated);
+        generated.command.clone()
+    } else {
+        prompt_for_command(&generated)?
+    };
+
+    if command.trim().is_empty() {
+        println!("Canceled.");
+        return Ok(());
+    }
+
+    if looks_destructive(&command)
+        && !cli.yes
+        && !Confirm::new()
+            .with_prompt("This command may change or remove data. Execute it?")
+            .default(false)
+            .interact()?
+    {
+        println!("Canceled.");
+        return Ok(());
+    }
+
+    print_output_header();
+    let status = executor::execute(&shell, &command)?;
+    if !status.success() {
+        let code = status
+            .code()
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "signal".to_string());
+        return Err(AppError::CommandFailed(code));
+    }
+
+    Ok(())
+}
+
+fn print_generated(generated: &GeneratedCommand) {
+    print_explanation(generated);
+    print_command_block(&generated.command);
+}
+
+fn prompt_for_command(generated: &GeneratedCommand) -> Result<String, AppError> {
+    print_explanation(generated);
+    print_command_block(&generated.command);
+
+    let command = Input::<String>::new()
+        .with_prompt("Edit command, then press Enter")
+        .with_initial_text(generated.command.clone())
+        .allow_empty(true)
+        .interact_text()?;
+
+    Ok(command.trim().to_string())
+}
+
+fn print_explanation(generated: &GeneratedCommand) {
+    if generated.explanation.is_empty() {
+        return;
+    }
+
+    println!("{}", style_bold("Explanation"));
+    println!("  {}", generated.explanation);
+    println!();
+}
+
+fn print_command_block(command: &str) {
+    println!("{}", style_bold("Command"));
+    println!("{}", style_dim("----------------------------------------"));
+    println!("{} {}", style_dim("$"), style_command(command));
+    println!("{}", style_dim("----------------------------------------"));
+    println!();
+}
+
+fn print_output_header() {
+    println!("{}", style_bold("Output"));
+    println!("{}", style_dim("----------------------------------------"));
+}
+
+fn log_verbose(verbose: bool, message: impl AsRef<str>) {
+    if verbose {
+        eprintln!("[aicli] {}", message.as_ref());
+    }
+}
+
+fn log_proxy_env(verbose: bool) {
+    if !verbose {
+        return;
+    }
+
+    for name in [
+        "https_proxy",
+        "HTTPS_PROXY",
+        "http_proxy",
+        "HTTP_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+        "no_proxy",
+        "NO_PROXY",
+    ] {
+        match std::env::var(name) {
+            Ok(value) if !value.trim().is_empty() => {
+                eprintln!("[aicli] env {name}={}", redact_url_userinfo(&value));
+            }
+            _ => eprintln!("[aicli] env {name}=<unset>"),
+        }
+    }
+}
+
+fn redact_url_userinfo(input: &str) -> String {
+    let mut output = input.to_string();
+    let mut search_start = 0;
+
+    while let Some(relative_scheme) = output[search_start..].find("://") {
+        let authority_start = search_start + relative_scheme + 3;
+        let authority_end = output[authority_start..]
+            .find(|ch: char| ch == '/' || ch == '?' || ch == '#' || ch.is_whitespace())
+            .map(|offset| authority_start + offset)
+            .unwrap_or_else(|| output.len());
+
+        if let Some(relative_at) = output[authority_start..authority_end].find('@') {
+            let at = authority_start + relative_at;
+            output.replace_range(authority_start..at, "***");
+            search_start = authority_start + 4;
+        } else {
+            search_start = authority_end;
+        }
+    }
+
+    output
+}
+
+fn style_bold(text: &str) -> String {
+    style(text, "1")
+}
+
+fn style_dim(text: &str) -> String {
+    style(text, "2")
+}
+
+fn style_command(text: &str) -> String {
+    style(text, "1;36")
+}
+
+fn style(text: &str, code: &str) -> String {
+    if use_color() {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+fn use_color() -> bool {
+    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+#[derive(Debug, thiserror::Error)]
+enum AppError {
+    #[error(transparent)]
+    Config(#[from] aicli::config::ConfigError),
+    #[error(transparent)]
+    Llm(#[from] aicli::llm::LlmError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Dialoguer(#[from] dialoguer::Error),
+    #[error("command exited with status {0}")]
+    CommandFailed(String),
+    #[error("missing prompt. Try: aicli \"看看当前git项目哪些文件很大\"")]
+    MissingPrompt,
+}
