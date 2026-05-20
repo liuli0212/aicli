@@ -1,4 +1,5 @@
 use aicli::config::{config_template, AppConfig};
+use aicli::environment::{missing_command_heads, EnvironmentSnapshot};
 use aicli::executor;
 use aicli::llm::{create_generator, GeneratedCommand};
 use aicli::prompt::RequestContext;
@@ -82,10 +83,17 @@ async fn run() -> Result<(), AppError> {
         .or_else(|| std::env::var("SHELL").ok())
         .unwrap_or_else(|| "/bin/sh".to_string());
 
+    let environment = EnvironmentSnapshot::collect();
     let context = RequestContext {
         cwd: std::env::current_dir()?.display().to_string(),
         shell: shell.clone(),
         os: std::env::consts::OS.to_string(),
+        available_commands: environment.available_commands.clone(),
+        missing_commands: environment.missing_commands.clone(),
+        capability_notes: environment.capability_notes.clone(),
+        limitations: environment.limitations.clone(),
+        git_root: environment.git_root.clone(),
+        git_branch: environment.git_branch.clone(),
     };
 
     log_verbose(
@@ -101,6 +109,31 @@ async fn run() -> Result<(), AppError> {
     log_verbose(verbose, format!("provider={provider}"));
     log_verbose(verbose, format!("cwd={}", context.cwd));
     log_verbose(verbose, format!("shell={}", context.shell));
+    log_verbose(
+        verbose,
+        format!(
+            "available_commands={}",
+            context.available_commands.join(",")
+        ),
+    );
+    log_verbose(
+        verbose,
+        format!("missing_commands={}", context.missing_commands.join(",")),
+    );
+    log_verbose(
+        verbose,
+        format!("capability_notes={}", context.capability_notes.join(";")),
+    );
+    log_verbose(
+        verbose,
+        format!("limitations={}", context.limitations.join(";")),
+    );
+    if let Some(git_root) = &context.git_root {
+        log_verbose(verbose, format!("git_root={git_root}"));
+    }
+    if let Some(git_branch) = &context.git_branch {
+        log_verbose(verbose, format!("git_branch={git_branch}"));
+    }
     log_proxy_env(verbose);
 
     let generator = create_generator(&provider, cli.model, &config, verbose)?;
@@ -108,6 +141,7 @@ async fn run() -> Result<(), AppError> {
 
     if cli.dry_run {
         print_generated(&generated);
+        print_missing_command_warning(&generated.command);
         return Ok(());
     }
 
@@ -120,6 +154,10 @@ async fn run() -> Result<(), AppError> {
 
     if command.trim().is_empty() {
         println!("Canceled.");
+        return Ok(());
+    }
+
+    if !handle_missing_commands(&command, cli.yes)? {
         return Ok(());
     }
 
@@ -186,6 +224,47 @@ fn print_command_block(command: &str) {
 fn print_output_header() {
     println!("{}", style_bold("Output"));
     println!("{}", style_dim("----------------------------------------"));
+}
+
+fn handle_missing_commands(command: &str, yes: bool) -> Result<bool, AppError> {
+    let missing = missing_command_heads(command);
+    if missing.is_empty() {
+        return Ok(true);
+    }
+
+    print_missing_command_warning_with_list(&missing);
+
+    if yes {
+        return Err(AppError::UnavailableCommands(missing.join(", ")));
+    }
+
+    if !Confirm::new()
+        .with_prompt("This command references unavailable commands. Run anyway?")
+        .default(false)
+        .interact()?
+    {
+        println!("Canceled.");
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+fn print_missing_command_warning(command: &str) {
+    let missing = missing_command_heads(command);
+    if !missing.is_empty() {
+        print_missing_command_warning_with_list(&missing);
+    }
+}
+
+fn print_missing_command_warning_with_list(missing: &[String]) {
+    println!("{}", style_bold("Warning"));
+    println!(
+        "  This machine does not appear to have: {}",
+        missing.join(", ")
+    );
+    println!("  Edit the command, install the tool, or run from a shell where it exists.");
+    println!();
 }
 
 fn log_verbose(verbose: bool, message: impl AsRef<str>) {
@@ -279,4 +358,6 @@ enum AppError {
     CommandFailed(String),
     #[error("missing prompt. Try: aicli \"看看当前git项目哪些文件很大\"")]
     MissingPrompt,
+    #[error("generated command references unavailable command(s): {0}")]
+    UnavailableCommands(String),
 }

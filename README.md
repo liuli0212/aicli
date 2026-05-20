@@ -160,6 +160,29 @@ aicli --provider gemini --model gemini-2.5-flash "显示最近提交"
 aicli --provider openai_compat --model qwen2.5-coder "查找大文件"
 ```
 
+## 本机环境感知
+
+`aicli` 会在请求模型前收集一份轻量本机环境快照：
+
+- 当前工作目录
+- shell 和操作系统
+- 是否在 git 仓库里，以及 git root / branch
+- 常见命令哪些存在，比如 `git`、`find`、`rg`、`jq`、`fd`、`docker`
+- 常见命令哪些不存在，模型会被要求避开这些命令
+- 当前平台的命令能力，比如 `find -printf`、`sort -h`、`stat -c`、`readlink -f` 是否可用
+
+如果模型还是生成了本机找不到的命令，`aicli` 会在执行前提示。例如：
+
+```text
+Warning
+  This machine does not appear to have: fd
+  Edit the command, install the tool, or run from a shell where it exists.
+```
+
+在 `-y` 模式下，如果生成命令明显引用了不存在的命令，`aicli` 会拒绝直接执行，避免一上来就 `command not found`。
+
+这层探测是每次运行时做的，所以同一个二进制复制到 Linux 或 macOS 后，会按那台机器自己的能力生成命令。比如 macOS 上通常没有 GNU `find -printf`，`aicli` 会把这个限制告诉模型，让它优先生成 `find ... -exec du/stat ...` 这类更可移植的写法。
+
 ## 日志与排错
 
 使用 `-v` / `--verbose` 可以把诊断信息打印到 stderr，包括：
@@ -167,6 +190,9 @@ aicli --provider openai_compat --model qwen2.5-coder "查找大文件"
 - 配置文件路径
 - provider 和 model
 - 当前工作目录和 shell
+- 可用命令和缺失命令
+- 平台能力和限制，比如 GNU/BSD `stat` 差异
+- git root 和 git branch
 - 代理环境变量
 - 脱敏后的请求 endpoint
 - HTTP 响应状态
