@@ -6,8 +6,11 @@ use aicli::prompt::RequestContext;
 use aicli::safety::looks_destructive;
 use clap::Parser;
 use dialoguer::{Confirm, Input};
+use std::fs;
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::process::{Command as ProcessCommand, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -157,9 +160,7 @@ async fn run() -> Result<(), AppError> {
         return Ok(());
     }
 
-    if !handle_missing_commands(&command, cli.yes)? {
-        return Ok(());
-    }
+    warn_missing_commands(&command);
 
     if looks_destructive(&command)
         && !cli.yes
@@ -194,6 +195,10 @@ fn prompt_for_command(generated: &GeneratedCommand) -> Result<String, AppError> 
     print_explanation(generated);
     print_command_block(&generated.command);
 
+    if is_multiline(&generated.command) {
+        return prompt_for_script(&generated.command);
+    }
+
     let command = Input::<String>::new()
         .with_prompt("Edit command, then press Enter")
         .with_initial_text(generated.command.clone())
@@ -201,6 +206,51 @@ fn prompt_for_command(generated: &GeneratedCommand) -> Result<String, AppError> 
         .interact_text()?;
 
     Ok(command.trim().to_string())
+}
+
+fn prompt_for_script(script: &str) -> Result<String, AppError> {
+    let action = Input::<String>::new()
+        .with_prompt("Press Enter to run, type 'e' to edit, or 'q' to cancel")
+        .allow_empty(true)
+        .interact_text()?;
+
+    match action.trim() {
+        "" => Ok(script.trim().to_string()),
+        "e" | "E" => edit_script(script),
+        "q" | "Q" => Ok(String::new()),
+        other => Ok(other.to_string()),
+    }
+}
+
+fn edit_script(script: &str) -> Result<String, AppError> {
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
+    let path = temp_script_path();
+
+    fs::write(&path, script)?;
+    let editor_command = format!("{} {}", editor, shell_quote_path(&path));
+    let status = ProcessCommand::new("/bin/sh")
+        .arg("-lc")
+        .arg(editor_command)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()?;
+
+    if !status.success() {
+        let _ = fs::remove_file(&path);
+        return Err(AppError::EditorFailed(
+            status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".to_string()),
+        ));
+    }
+
+    let edited = fs::read_to_string(&path)?;
+    let _ = fs::remove_file(&path);
+    Ok(edited.trim().to_string())
 }
 
 fn print_explanation(generated: &GeneratedCommand) {
@@ -214,9 +264,20 @@ fn print_explanation(generated: &GeneratedCommand) {
 }
 
 fn print_command_block(command: &str) {
-    println!("{}", style_bold("Command"));
+    let label = if is_multiline(command) {
+        "Script"
+    } else {
+        "Command"
+    };
+    println!("{}", style_bold(label));
     println!("{}", style_dim("----------------------------------------"));
-    println!("{} {}", style_dim("$"), style_command(command));
+    if is_multiline(command) {
+        for line in command.lines() {
+            println!("{}", style_command(line));
+        }
+    } else {
+        println!("{} {}", style_dim("$"), style_command(command));
+    }
     println!("{}", style_dim("----------------------------------------"));
     println!();
 }
@@ -226,28 +287,13 @@ fn print_output_header() {
     println!("{}", style_dim("----------------------------------------"));
 }
 
-fn handle_missing_commands(command: &str, yes: bool) -> Result<bool, AppError> {
+fn warn_missing_commands(command: &str) {
     let missing = missing_command_heads(command);
     if missing.is_empty() {
-        return Ok(true);
+        return;
     }
 
     print_missing_command_warning_with_list(&missing);
-
-    if yes {
-        return Err(AppError::UnavailableCommands(missing.join(", ")));
-    }
-
-    if !Confirm::new()
-        .with_prompt("This command references unavailable commands. Run anyway?")
-        .default(false)
-        .interact()?
-    {
-        println!("Canceled.");
-        return Ok(false);
-    }
-
-    Ok(true)
 }
 
 fn print_missing_command_warning(command: &str) {
@@ -263,7 +309,7 @@ fn print_missing_command_warning_with_list(missing: &[String]) {
         "  This machine does not appear to have: {}",
         missing.join(", ")
     );
-    println!("  Edit the command, install the tool, or run from a shell where it exists.");
+    println!("  This is only a PATH-based hint; aliases, shell functions, or other environments may still work.");
     println!();
 }
 
@@ -344,6 +390,26 @@ fn use_color() -> bool {
     std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }
 
+fn is_multiline(command: &str) -> bool {
+    command.lines().count() > 1
+}
+
+fn temp_script_path() -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "aicli-script-{}-{timestamp}.sh",
+        std::process::id()
+    ))
+}
+
+fn shell_quote_path(path: &std::path::Path) -> String {
+    let raw = path.to_string_lossy();
+    format!("'{}'", raw.replace('\'', "'\\''"))
+}
+
 #[derive(Debug, thiserror::Error)]
 enum AppError {
     #[error(transparent)]
@@ -356,8 +422,8 @@ enum AppError {
     Dialoguer(#[from] dialoguer::Error),
     #[error("command exited with status {0}")]
     CommandFailed(String),
+    #[error("editor exited with status {0}")]
+    EditorFailed(String),
     #[error("missing prompt. Try: aicli \"看看当前git项目哪些文件很大\"")]
     MissingPrompt,
-    #[error("generated command references unavailable command(s): {0}")]
-    UnavailableCommands(String),
 }

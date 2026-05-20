@@ -266,6 +266,12 @@ fn tokenize_shell_heads(command: &str) -> Vec<String> {
             continue;
         }
 
+        if ch == '\n' {
+            push_token(&mut tokens, &mut current);
+            tokens.push(";".to_string());
+            continue;
+        }
+
         if ch.is_whitespace() {
             push_token(&mut tokens, &mut current);
             continue;
@@ -363,5 +369,12 @@ mod tests {
         let missing = missing_command_heads("find . -type f | definitely-not-aicli-sorter");
 
         assert_eq!(missing, vec!["definitely-not-aicli-sorter"]);
+    }
+
+    #[test]
+    fn treats_newline_as_command_separator() {
+        let missing = missing_command_heads("echo ok\ndefinitely-not-aicli-command");
+
+        assert_eq!(missing, vec!["definitely-not-aicli-command"]);
     }
 }
